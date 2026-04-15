@@ -1,0 +1,1113 @@
+---
+title: "THC, 11OH, Cp v time"
+output: html_document
+date: "2025-11-11"
+---
+
+This code was used for Figure 2 to plot the observed plasma concentrations for THC, 11-OH-THC, 11-COOH-THC, and its acyl glucuronide on the control and treated study days. 
+
+The plots are individual points, average line, and standard deviation as shaded gray region. 
+
+The points bloq are not included in the average and are represented as 1/2 lloq and an x in the plots. 
+
+# Set up 
+
+Set the directory to the folder the R markdown is in. 
+
+#### Clear work space 
+
+```{r}
+
+rm(list = ls(all.names = TRUE)); gc()
+if (!is.null(dev.list())) graphics.off()
+cat("\014")
+
+
+```
+
+#### Load libraries 
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+library(openxlsx)
+
+```
+
+#### Import df and set up to long format
+
+```{r}
+df <- read_excel("THC_all_met_Cpt.xlsx", sheet = "All")
+
+
+# Convert all analyte columns to character so pivot_longer won't fail
+df <- df %>%
+  mutate(across(
+    .cols = c(starts_with("THC_"), starts_with("OH_"),
+              starts_with("COOH_"), starts_with("Gluc_")),
+    .fns = as.character
+  ))
+
+
+df_long <- df %>%
+  pivot_longer(
+    cols = c(starts_with("THC_"), starts_with("OH_"),
+             starts_with("COOH_"), starts_with("Gluc_")),
+    names_to = c("Analyte", "Condition"),
+    names_sep = "_",
+    values_to = "Concentration_nM"
+  ) %>%
+  mutate(
+    Condition = factor(Condition, levels = c("HC", "HT", "EC", "ET")),
+    
+    # Recode analyte names for clarity
+    Analyte = recode(Analyte,
+                     "THC"  = "THC",
+                     "OH"   = "11-OH-THC",
+                     "COOH" = "11-COOH-THC",
+                     "Gluc" = "11-COOH-THC glucuronide"),
+
+    # Order facets: THC > OH > COOH > Gluc
+    Analyte = factor(Analyte,
+                     levels = c("THC", "11-OH-THC", "11-COOH-THC", "11-COOH-THC glucuronide")),
+
+    Concentration_nM = suppressWarnings(as.numeric(Concentration_nM)),
+    Dose_nmol = suppressWarnings(as.numeric(Dose_nmol))
+  )
+
+# Replace special cases with NA
+df[df == "< 0" | df == "N/A" | df == "NA"] <- NA
+df_long[df_long == "< 0" | df_long == "N/A" | df_long == "NA"] <- NA
+
+### create new directory for future 
+
+out_dir <- "Cpt_figures"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+```
+
+### classification of df
+
+Note that for the LOQs we have determined that quantifiable is 20% within LLOQ. THC = 0.1 nM; OH = 0.1 nM; COOH = 1 nM; Gluc = 3 nM
+
+```{r}
+
+# Define LOQs
+loq_thc  <- 0.008
+loq_oh   <- 0.080
+loq_cooh <- 0.800
+loq_gluc <- 2.600
+
+# Pivot long, preserve raw values
+df_long_raw <- df %>%
+  pivot_longer(
+    cols = c(starts_with("THC_"), starts_with("OH_"),
+             starts_with("COOH_"), starts_with("Gluc_")),
+    names_to = c("Analyte", "SD"),
+    names_sep = "_",
+    values_to = "raw"
+  ) %>%
+  mutate(
+    raw_chr  = as.character(raw),
+    num_val  = suppressWarnings(as.numeric(raw_chr)),
+
+    # Short analyte names for classification logic
+    Analyte_short = recode(Analyte,
+                           "THC"  = "THC",
+                           "OH"   = "OH",
+                           "COOH" = "COOH",
+                           "Gluc" = "Gluc"),
+
+    # Apply classification
+    class = case_when(
+      # Missing or coded missing
+      raw_chr %in% c("NA", "N/A") | is.na(raw_chr) ~ "BLD",
+      str_detect(raw_chr, "<")                    ~ "LT0",
+
+      # THC
+      Analyte_short == "THC"  & !is.na(num_val) & num_val > loq_thc  ~ "Quant",
+      Analyte_short == "THC"  & !is.na(num_val)                      ~ "BLQ",
+
+      # OH
+      Analyte_short == "OH"   & !is.na(num_val) & num_val > loq_oh   ~ "Quant",
+      Analyte_short == "OH"   & !is.na(num_val)                      ~ "BLQ",
+
+      # COOH
+      Analyte_short == "COOH" & !is.na(num_val) & num_val > loq_cooh ~ "Quant",
+      Analyte_short == "COOH" & !is.na(num_val)                      ~ "BLQ",
+
+      # Glucuronide
+      Analyte_short == "Gluc" & !is.na(num_val) & num_val > loq_gluc ~ "Quant",
+      Analyte_short == "Gluc" & !is.na(num_val)                      ~ "BLQ",
+
+      TRUE ~ "BLD"
+    )
+  )
+
+# ---- Summary of counts per class ----
+summary_table <- df_long_raw %>%
+  group_by(Time_h, Analyte_short, SD, class) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from = class,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  rename(
+    n_quant = Quant,
+    n_BLQ   = BLQ,
+    n_LT0   = LT0,
+    n_BLD   = BLD
+  ) %>%
+  arrange(Analyte_short, SD, Time_h)
+
+View(summary_table)
+
+
+# Save summary table to Excel
+outfile <- file.path(out_dir, "Quant_n_pts_THC_met.xlsx")
+
+write.xlsx(summary_table,
+           file = outfile,
+           overwrite = TRUE)
+
+
+```
+
+#### plotting of the quantifable time points 
+
+```{r}
+
+### create directory 
+quant_dir <- file.path(out_dir, "Quantifiability")
+if (!dir.exists(quant_dir)) dir.create(quant_dir)
+
+### prepare plotting df 
+plot_df <- summary_table %>%
+  mutate(
+    n_BLD_combined = n_BLD + n_LT0
+  ) %>%
+  select(Time_h, Analyte_short, SD,
+         Quantifiable = n_quant,
+         BLQ = n_BLQ,
+         BLD = n_BLD_combined) %>%
+  pivot_longer(
+    cols = c(Quantifiable, BLQ, BLD),
+    names_to = "Class",
+    values_to = "Count"
+  ) %>%
+  mutate(
+    Class = factor(Class,
+                   levels = c("Quantifiable", "BLQ", "BLD"))
+  )
+
+### plotting funciton 
+
+plot_quant_time <- function(df, analyte, study_day) {
+
+  df_sub <- df %>%
+    filter(Analyte_short == analyte,
+           SD == study_day)
+
+  ggplot(df_sub, aes(x = Time_h, y = Count,
+                     linetype = Class,
+                     shape = Class,
+                     color = Class)) +
+
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2) +
+
+    # ---- Y axis: increments of 1 ----
+    scale_y_continuous(
+      limits = c(0, 13),
+      breaks = seq(0, 13, 1)
+    ) +
+
+    # ---- X axis: increments of 4 ----
+    scale_x_continuous(
+      breaks = seq(0, max(df_sub$Time_h, na.rm = TRUE), 4)
+    ) +
+
+    scale_linetype_manual(values = c(
+      Quantifiable = "solid",
+      BLQ          = "dashed",
+      BLD          = "dotted"
+    )) +
+
+    scale_shape_manual(values = c(
+      Quantifiable = 16,
+      BLQ          = 17,
+      BLD          = 15
+    )) +
+
+    scale_color_manual(values = c(
+      Quantifiable = "black",
+      BLQ          = "grey40",
+      BLD          = "grey70"
+    )) +
+
+    labs(
+      x = "Time (h)",
+      y = "Number of samples",
+      color = "Legend",
+      linetype = "Legend",
+      shape = "Legend"
+    ) +
+
+    theme_bw(base_size = 13) +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "right"
+    )
+}
+
+
+## loope de loop over analytes by study days 
+
+analytes <- unique(plot_df$Analyte_short)
+study_days <- unique(plot_df$SD)
+
+for (a in analytes) {
+  for (sd in study_days) {
+
+    p <- plot_quant_time(plot_df, analyte = a, study_day = sd)
+
+    fname_base <- paste0("Quant_", a, "_", sd)
+
+    ggsave(
+      filename = file.path(quant_dir, paste0(fname_base, ".png")),
+      plot = p,
+      width = 5,
+      height = 4,
+      dpi = 300
+    )
+
+    ggsave(
+      filename = file.path(quant_dir, paste0(fname_base, ".pdf")),
+      plot = p,
+      width = 5,
+      height = 4
+    )
+  }
+}
+
+
+
+```
+
+
+# Averages plots for the hydrocortisone arm control (HC) and treated (HT) study days
+
+
+```{r}
+
+
+df_summary <- df_long %>%
+  group_by(Analyte, Condition, Time_h) %>%
+  summarise(
+    mean_conc = mean(Concentration_nM, na.rm = TRUE),
+    sd_conc   = sd(Concentration_nM, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+
+```
+
+
+
+# Individual Plots 
+
+## HC 
+
+#### THC log 
+
+```{r}
+
+bloq_thc  <- 0.008
+bloq_half_thc <- 0.005
+
+# =========================================================================
+# Filter HC only
+
+df_THC_HC <- df_long %>%
+  filter(Analyte == "THC", Condition == "HC") %>%
+  mutate(
+    conc_plot = case_when(
+      Concentration_nM < bloq_thc ~ bloq_half_thc,
+      TRUE ~ Concentration_nM
+    ),
+    is_blq = Concentration_nM < bloq_thc
+  )
+
+# Summary for HC
+df_THC_HC_summary <- df_THC_HC %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(Concentration_nM, na.rm = TRUE),
+    sd_conc   = sd(Concentration_nM, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_THC_HC <- ggplot() +
+     
+  # Background gridlines (draw first)
+  geom_hline(
+    yintercept = c(0.001, 0.01, 0.1, 1, 10),
+    color = "gray90", linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = seq(0, 24, 4),
+    color = "gray90", linetype = "dashed"
+  ) +
+
+  # SD ribbon
+  geom_ribbon(
+    data = df_THC_HC_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 0.001),
+      ymax = mean_conc + sd_conc
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+
+  # Mean line
+  geom_line(
+    data = df_THC_HC_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+
+  # Observed points
+  geom_point(
+    data = df_THC_HC %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    color = "black", size = 2
+  ) +
+
+  # BLQ points as X
+  geom_point(
+    data = df_THC_HC %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+
+  # Scales
+  scale_y_log10(
+    breaks = c(0.001, 0.01, 0.1, 1, 10),
+    labels = scales::label_number(), ##this does not set it correctly.. 
+    limits = c(0.001, 10)
+  ) +
+  annotation_logticks(sides = "l") +
+
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+
+  labs(
+    x = "Time (h)",
+    y = "THC (nM)"
+  ) +
+
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_blank(),
+    panel.grid = element_blank()
+  )
+
+
+plot_THC_HC
+
+
+# =========================================================================
+# Filter HT only
+df_THC_HT <- df_long %>%
+  filter(Analyte == "THC", Condition == "HT") %>%
+  mutate(
+    conc_plot = case_when(
+      Concentration_nM < bloq_thc ~ bloq_half_thc,
+      TRUE ~ Concentration_nM
+    ),
+    is_blq = Concentration_nM < bloq_thc
+  )
+
+# Summary for HT
+df_THC_HT_summary <- df_THC_HT %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(Concentration_nM, na.rm = TRUE),
+    sd_conc   = sd(Concentration_nM, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# HT plot (matching HC style)
+plot_THC_HT <- ggplot() +
+  
+  # Background gridlines
+  geom_hline(
+    yintercept = c(0.001, 0.01, 0.1, 1, 10),
+    color = "gray90", linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = seq(0, 24, 4),
+    color = "gray90", linetype = "dashed"
+  ) +
+  
+  # SD ribbon (clamped at lower limit)
+  geom_ribbon(
+    data = df_THC_HT_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 0.001),
+      ymax = mean_conc + sd_conc
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+  
+  # Mean line
+  geom_line(
+    data = df_THC_HT_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+  
+  # Observed points (non-BLQ)
+  geom_point(
+    data = df_THC_HT %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    color = "black", size = 2
+  ) +
+  
+  # BLQ points as X
+  geom_point(
+    data = df_THC_HT %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+  
+  # Log scale
+  scale_y_log10(
+    breaks = c(0.001, 0.01, 0.1, 1, 10),
+    labels = function(x) format(x, scientific = FALSE, trim = TRUE),
+    limits = c(0.001, 10)
+  ) +
+  annotation_logticks(sides = "l") +
+  
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+  
+  labs(
+    x = "Time (h)",
+    y = "THC (nM)"
+  ) +
+  
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_blank(),
+    panel.grid = element_blank()
+  )
+
+plot_THC_HT
+
+
+# View plots 
+
+plot_THC_HC
+plot_THC_HT
+
+```
+
+
+#### OH log 
+
+```{r}
+
+# --- OH thresholds ---
+bloq_oh  <- 0.08
+bloq_half_oh <- 0.05
+lloq_oh  <- 0.1      # not plotted, just for reference
+
+
+# HC ============================================================================
+
+# Filter OH HC
+
+df_OH_HC <- df_long %>%
+  filter(Analyte == "11-OH-THC", Condition == "HC") %>%
+  mutate(
+    conc_plot = if_else(Concentration_nM < bloq_oh, bloq_half_oh, Concentration_nM),
+    is_blq    = Concentration_nM < bloq_oh
+  )
+
+# Use conc_plot for means and SD
+
+df_OH_HC_summary <- df_OH_HC %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(conc_plot, na.rm = TRUE),
+    sd_conc   = sd(conc_plot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_OH_HC <- ggplot() +
+
+  # Background
+  geom_hline(yintercept = c(0.01, 0.1, 1, 10),
+             color = "gray90", linetype = "dashed") +
+  geom_vline(xintercept = seq(0, 24, 4),
+             color = "gray90", linetype = "dashed") +
+
+  # SD ribbon (clamped to log limits)
+  geom_ribbon(
+    data = df_OH_HC_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 0.01),
+      ymax = pmin(mean_conc + sd_conc, 10)
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+
+  # Mean line
+  geom_line(
+    data = df_OH_HC_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+
+  # Observed points
+  geom_point(
+    data = df_OH_HC %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    size = 2, color = "black"
+  ) +
+
+  # BLQ as X
+  geom_point(
+    data = df_OH_HC %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+
+  scale_y_log10(
+    breaks = c(0.01, 0.1, 1, 10),
+    limits = c(0.01, 10)
+  ) +
+  annotation_logticks(sides = "l") +
+
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+
+  labs(
+    x = "Time (h)",
+    y = "11-OH-THC (nM)"
+  ) +
+
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+
+plot_OH_HC
+
+
+# HT ============================================================================
+
+# Filter OH HT
+
+df_OH_HT <- df_long %>%
+  filter(Analyte == "11-OH-THC", Condition == "HT") %>%
+  mutate(
+    conc_plot = if_else(Concentration_nM < bloq_oh, bloq_half_oh, Concentration_nM),
+    is_blq    = Concentration_nM < bloq_oh
+  )
+
+df_OH_HT_summary <- df_OH_HT %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(conc_plot, na.rm = TRUE),
+    sd_conc   = sd(conc_plot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_OH_HT <- ggplot() +
+
+  geom_hline(yintercept = c(0.01, 0.1, 1, 10),
+             color = "gray90", linetype = "dashed") +
+  geom_vline(xintercept = seq(0, 24, 4),
+             color = "gray90", linetype = "dashed") +
+
+  geom_ribbon(
+    data = df_OH_HT_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 0.01),
+      ymax = pmin(mean_conc + sd_conc, 10)
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+
+  geom_line(
+    data = df_OH_HT_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+
+  geom_point(
+    data = df_OH_HT %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    size = 2, color = "black"
+  ) +
+
+  geom_point(
+    data = df_OH_HT %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+
+  scale_y_log10(
+    breaks = c(0.01, 0.1, 1, 10),
+    limits = c(0.01, 10)
+  ) +
+  annotation_logticks(sides = "l") +
+
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+
+  labs(
+    x = "Time (h)",
+    y = "11-OH-THC (nM)"
+  ) +
+
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+
+plot_OH_HT
+
+
+# View 
+
+plot_OH_HC
+plot_OH_HT
+
+```
+
+
+
+#### COOH log 
+
+```{r}
+
+# --- COOH thresholds ---
+bloq_cooh      <-  0.8
+bloq_half_cooh <-  0.5
+lloq_cooh      <-  1
+
+
+# HC ============================================================================
+df_COOH_HC <- df_long %>%
+  filter(Analyte == "11-COOH-THC", Condition == "HC") %>%
+  mutate(
+    conc_plot = if_else(Concentration_nM < bloq_cooh, bloq_half_cooh, Concentration_nM),
+    is_blq    = Concentration_nM < bloq_cooh
+  )
+
+df_COOH_HC_summary <- df_COOH_HC %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(conc_plot, na.rm = TRUE),
+    sd_conc   = sd(conc_plot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_COOH_HC <- ggplot() +
+     
+  # Background
+  geom_hline(
+    yintercept = c(0.1, 1, 10, 100),
+    color = "gray90", linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = seq(0, 24, 4),
+    color = "gray90", linetype = "dashed"
+  ) +
+
+  # Ribbon
+  geom_ribbon(
+    data = df_COOH_HC_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 0.1),
+      ymax = pmin(mean_conc + sd_conc, 200)
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+
+  # Mean line
+  geom_line(
+    data = df_COOH_HC_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+
+  # Points
+  geom_point(
+    data = df_COOH_HC %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    size = 2, color = "black"
+  ) +
+  geom_point(
+    data = df_COOH_HC %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+
+  # Y scale
+  scale_y_log10(
+    breaks = c(0.1, 1, 10, 100),
+    limits = c(0.1, 200)
+  ) +
+  annotation_logticks(sides = "l") +
+
+  # X scale
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+
+  labs(
+    x = "Time (h)",
+    y = "11-COOH-THC (nM)"
+  ) +
+
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+plot_COOH_HC
+
+
+
+# HT ============================================================================
+df_COOH_HT <- df_long %>%
+  filter(Analyte == "11-COOH-THC", Condition == "HT") %>%
+  mutate(
+    conc_plot = if_else(Concentration_nM < bloq_cooh, bloq_half_cooh, Concentration_nM),
+    is_blq    = Concentration_nM < bloq_cooh
+  )
+
+df_COOH_HT_summary <- df_COOH_HT %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(conc_plot, na.rm = TRUE),
+    sd_conc   = sd(conc_plot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_COOH_HT <- ggplot() +
+     
+  geom_hline(
+    yintercept = c(0.1, 1, 10, 100),
+    color = "gray90", linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = seq(0, 24, 4),
+    color = "gray90", linetype = "dashed"
+  ) +
+
+  geom_ribbon(
+    data = df_COOH_HT_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 0.1),
+      ymax = pmin(mean_conc + sd_conc, 200)
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+
+  geom_line(
+    data = df_COOH_HT_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+
+  geom_point(
+    data = df_COOH_HT %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    size = 2, color = "black"
+  ) +
+  geom_point(
+    data = df_COOH_HT %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+
+  scale_y_log10(
+    breaks = c(0.1, 1, 10, 100),
+    limits = c(0.1, 200)
+  ) +
+  annotation_logticks(sides = "l") +
+
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+
+  labs(
+    x = "Time (h)",
+    y = "11-COOH-THC (nM)"
+  ) +
+
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+plot_COOH_HT
+
+
+# View 
+plot_COOH_HC
+plot_COOH_HT
+
+
+
+```
+
+
+#### Gluc log 
+
+```{r}
+
+# --- COOH glucuronide thresholds ---
+bloq_gluc      <- 2.6
+bloq_half_gluc <- 1.5
+lloq_gluc      <- 3
+
+
+# HC ============================================================================
+df_gluc_HC <- df_long %>%
+  filter(Analyte == "11-COOH-THC glucuronide", Condition == "HC") %>%
+  mutate(
+    conc_plot = if_else(Concentration_nM < bloq_gluc, bloq_half_gluc, Concentration_nM),
+    is_blq    = Concentration_nM < bloq_gluc
+  )
+
+df_gluc_HC_summary <- df_gluc_HC %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(conc_plot, na.rm = TRUE),
+    sd_conc   = sd(conc_plot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_gluc_HC <- ggplot() +
+     
+  # Background
+  geom_hline(
+    yintercept = c(1, 10, 100),
+    color = "gray90", linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = seq(0, 24, 4),
+    color = "gray90", linetype = "dashed"
+  ) +
+
+  # Ribbon
+  geom_ribbon(
+    data = df_gluc_HC_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 1),
+      ymax = pmin(mean_conc + sd_conc, 200)
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+
+  # Mean line
+  geom_line(
+    data = df_gluc_HC_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+
+  # Points
+  geom_point(
+    data = df_gluc_HC %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    size = 2, color = "black"
+  ) +
+  geom_point(
+    data = df_gluc_HC %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+
+  # Y scale
+  scale_y_log10(
+    breaks = c(1, 10, 100),
+    limits = c(1, 200)
+  ) +
+  annotation_logticks(sides = "l") +
+
+  # X scale
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+
+  labs(
+    x = "Time (h)",
+    y = "11-COOH-THC glucuronide (nM)"
+  ) +
+
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+plot_gluc_HC
+
+
+
+# HT ============================================================================
+df_gluc_HT <- df_long %>%
+  filter(Analyte == "11-COOH-THC glucuronide", Condition == "HT") %>%
+  mutate(
+    conc_plot = if_else(Concentration_nM < bloq_gluc, bloq_half_gluc, Concentration_nM),
+    is_blq    = Concentration_nM < bloq_gluc
+  )
+
+df_gluc_HT_summary <- df_gluc_HT %>%
+  group_by(Time_h) %>%
+  summarise(
+    mean_conc = mean(conc_plot, na.rm = TRUE),
+    sd_conc   = sd(conc_plot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_gluc_HT <- ggplot() +
+     
+  geom_hline(
+    yintercept = c(1, 10, 100),
+    color = "gray90", linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = seq(0, 24, 4),
+    color = "gray90", linetype = "dashed"
+  ) +
+
+  geom_ribbon(
+    data = df_gluc_HT_summary,
+    aes(
+      x = Time_h,
+      ymin = pmax(mean_conc - sd_conc, 1),
+      ymax = pmin(mean_conc + sd_conc, 200)
+    ),
+    fill = "gray70", alpha = 0.4
+  ) +
+
+  geom_line(
+    data = df_gluc_HT_summary,
+    aes(x = Time_h, y = mean_conc),
+    color = "black", linewidth = 1
+  ) +
+
+  geom_point(
+    data = df_gluc_HT %>% filter(!is_blq),
+    aes(x = Time_h, y = conc_plot),
+    size = 2, color = "black"
+  ) +
+  geom_point(
+    data = df_gluc_HT %>% filter(is_blq),
+    aes(x = Time_h, y = conc_plot),
+    shape = 4, size = 3, stroke = 1, color = "black"
+  ) +
+
+  scale_y_log10(
+    breaks = c(1, 10, 100),
+    limits = c(1, 200)
+  ) +
+  annotation_logticks(sides = "l") +
+
+  scale_x_continuous(
+    breaks = seq(0, 24, 4),
+    limits = c(0, 24)
+  ) +
+
+  labs(
+    x = "Time (h)",
+    y = "11-COOH-THC glucuronide (nM)"
+  ) +
+
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank())
+
+plot_gluc_HT
+
+
+# View
+
+plot_gluc_HC
+plot_gluc_HT
+
+
+
+```
+
+
+#### save plots 
+
+```{r}
+
+save_plot <- function(plot_obj, plot_name) {
+  
+  # Build file names
+  png_file <- file.path(out_dir, paste0(plot_name, ".png"))
+  pdf_file <- file.path(out_dir, paste0(plot_name, ".pdf"))
+  
+  # Save PNG
+  ggsave(
+    filename = png_file,
+    plot = plot_obj,
+    width = 5,
+    height = 5,
+    units = "in",
+    dpi = 300
+  )
+  
+  # Save PDF
+  ggsave(
+    filename = pdf_file,
+    plot = plot_obj,
+    width = 5,
+    height = 5,
+    units = "in"
+  )
+  
+  message("Saved: ", plot_name)
+}
+
+
+save_plot(plot_THC_HC,  "plot_THC_HC")
+save_plot(plot_THC_HT,  "plot_THC_HT")
+
+save_plot(plot_OH_HC,   "plot_OH_HC")
+save_plot(plot_OH_HT,   "plot_OH_HT")
+
+save_plot(plot_COOH_HC, "plot_COOH_HC")
+save_plot(plot_COOH_HT, "plot_COOH_HT")
+
+save_plot(plot_gluc_HC, "plot_gluc_HC")
+save_plot(plot_gluc_HT, "plot_gluc_HT")
+
+
+```
+
+

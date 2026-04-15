@@ -1,0 +1,916 @@
+---
+title: "Effect Data"
+author: "Aurora"
+date: "2025-11-22"
+output: html_document
+---
+
+The aim of this code is to 
+
+
+# Set up 
+
+Make sure to set to the working directory of the folder 
+
+#### Clear work space 
+
+```{r}
+
+rm(list = ls(all.names = TRUE)); gc()
+if (!is.null(dev.list())) graphics.off()
+cat("\014")
+
+
+```
+
+#### Load libraries 
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ez)
+library(writexl)
+library(outliers)
+library(ggdist)
+library(cowplot)
+
+```
+
+
+## organize df 
+
+#### load df 
+
+```{r}
+
+df <- read_excel("20251122_PKPD.xlsx", sheet = "NCA")
+          # this is the df with the AUClast and Cmax for each study arm 
+
+
+# loading data for the effect vs time 
+
+HC <- read_excel("20251122_PKPD.xlsx", sheet = "HC")
+HT <- read_excel("20251122_PKPD.xlsx", sheet = "HT")
+
+
+       
+
+```
+
+
+##### add Cavg to df 
+
+```{r}
+
+df_cavg <- df %>%
+filter(Parameter == "AUClast") %>%
+mutate(
+Parameter = "Cavg",
+Value = Value / 24
+)
+
+df <- bind_rows(df, df_cavg)
+
+
+```
+
+##### assign arm and condition 
+
+```{r}
+
+df <- df %>%
+     mutate(
+          Arm = case_when(
+          SD %in% c("HC", "HT") ~ "Hydrocortisone",
+     ),
+          Condition = case_when(
+          SD %in% c("HC") ~ "Control",
+          SD %in% c("HT") ~ "Treated"
+     )
+)
+
+
+```
+
+#### create long df for paired testing later 
+
+```{r}
+
+
+df_long <- df %>%
+  select(SID, Arm, Effect, Parameter, Condition, Value) %>%
+  mutate(logValue = log(Value)) %>%
+  drop_na(logValue)
+
+
+```
+
+
+# summarize data 
+
+### functions 
+
+```{r}
+
+geo_summary <- function(x) {
+x <- x[!is.na(x)]
+n <- length(x)
+
+if (n < 2) {
+return(tibble(
+n = n,
+mean = ifelse(n == 0, NA_real_, mean(x)),
+geo_mean = ifelse(n == 0, NA_real_, exp(mean(log(x)))),
+min = ifelse(n == 0, NA_real_, min(x)),
+max = ifelse(n == 0, NA_real_, max(x)),
+CI90_low = NA_real_,
+CI90_high = NA_real_
+))
+}
+
+logx <- log(x)
+mean_x <- mean(x)
+sd_x <- sd(x)
+se_x <- sd_x / sqrt(n)
+mean_log <- mean(logx)
+sd_log   <- sd(logx)
+se_log   <- sd_log / sqrt(n)
+
+t_crit <- qt(0.95, df = n - 1)
+
+CI_low <- mean_x - t_crit * se_x 
+CI_high <- mean_x + t_crit * se_x
+
+CI_low_log  <- mean_log - t_crit * se_log
+CI_high_log <- mean_log + t_crit * se_log
+
+tibble(
+n        = n,
+mean     = mean_x, 
+CI_low   = CI_low, 
+CI_high  = CI_high,
+geo_mean = exp(mean_log),
+min      = min(x),
+max      = max(x),
+CI90_low_log  = exp(CI_low_log),
+CI90_high_log = exp(CI_high_log)
+)
+}
+
+
+```
+
+### run smmary 
+
+```{r}
+
+compute_effect_stats <- function(df_group) {
+
+# Control
+
+res_control <- geo_summary(df_group$Value[df_group$Condition == "Control"]) %>%
+mutate(Measure = "Control")
+
+# Treated
+
+res_treated <- geo_summary(df_group$Value[df_group$Condition == "Treated"]) %>%
+mutate(Measure = "Treated")
+
+# Treated / Control (paired)
+
+tc_df <- df_group %>%
+select(SID, Condition, Value) %>%
+pivot_wider(names_from = Condition, values_from = Value) %>%
+drop_na(Control, Treated) %>%
+mutate(TC = Treated / Control)
+
+res_tc <- geo_summary(tc_df$TC) %>%
+mutate(Measure = "TC_ratio")
+
+bind_rows(res_control, res_treated, res_tc)
+}
+
+
+```
+
+### compute 
+
+```{r}
+
+summary_stats <- df %>%
+group_by(Arm, Effect, Parameter) %>%
+group_modify(~ compute_effect_stats(.x)) %>%
+ungroup() %>%
+relocate(Arm, Effect, Parameter, Measure)
+
+
+```
+
+# paired t-test, grubbs, and FDR 
+
+### function 
+
+```{r}
+
+
+run_paired_tests <- function(df_long_arm) {
+  
+  effects_here <- unique(df_long_arm$Effect)
+  results_all <- list()
+  
+  for (eff in effects_here) {
+    
+    df_e <- df_long_arm %>% filter(Effect == eff)
+    params <- unique(df_e$Parameter)
+    
+    res_list <- list()
+    
+    for (p in params) {
+      
+      df_p <- df_e %>% filter(Parameter == p)
+      
+      df_wide <- df_p %>%
+        select(SID, Condition, logValue) %>%
+        pivot_wider(names_from = Condition, values_from = logValue) %>%
+        drop_na(Control, Treated)
+      
+      N_used <- nrow(df_wide)
+      if (N_used < 2) next
+      
+      # Paired t-test
+      tt <- t.test(df_wide$Treated, df_wide$Control, paired = TRUE)
+      
+      # Grubbs test (no deletion)
+      Gc <- tryCatch(grubbs.test(df_wide$Control), error = function(e) NA)
+      Gt <- tryCatch(grubbs.test(df_wide$Treated), error = function(e) NA)
+      
+      res_list[[p]] <- tibble(
+        Arm = unique(df_p$Arm),
+        Effect = eff,
+        Parameter = p,
+        N = N_used,
+        mean_log_Control = mean(df_wide$Control),
+        mean_log_Treated = mean(df_wide$Treated),
+        mean_log_diff = mean(df_wide$Treated - df_wide$Control),
+        t_stat = tt$statistic,
+        p_raw = tt$p.value,
+        
+        # Grubbs
+        G_control = ifelse(is.list(Gc), Gc$statistic, NA),
+        p_G_control = ifelse(is.list(Gc), Gc$p.value, NA),
+        
+        G_treated = ifelse(is.list(Gt), Gt$statistic, NA),
+        p_G_treated = ifelse(is.list(Gt), Gt$p.value, NA)
+      )
+    }
+    
+    results_e <- bind_rows(res_list)
+    
+    # Apply FDR within Arm × Effect
+    results_e <- results_e %>%
+      mutate(p_FDR = p.adjust(p_raw, method = "BH"))
+    
+    results_all[[eff]] <- results_e
+  }
+  
+  bind_rows(results_all)
+}
+
+
+```
+
+#### run 
+
+```{r}
+
+df_HC <- df_long %>% filter(Arm == "Hydrocortisone")
+
+
+paired_HC <- run_paired_tests(df_HC)
+
+```
+
+
+# save 
+
+### output
+
+```{r}
+
+output_dir <- "Effect_PD_Data"
+if (!dir.exists(output_dir)) {
+dir.create(output_dir)
+}
+
+# figures 
+
+fig_dir <- file.path(output_dir, "Figures")
+if (!dir.exists(fig_dir)) dir.create(fig_dir)
+
+```
+
+#### summary stats 
+
+```{r}
+
+effects <- unique(summary_stats$Effect)
+
+wb <- createWorkbook()
+
+for (eff in effects) {
+df_eff <- summary_stats %>%
+filter(Effect == eff) %>%
+arrange(Arm, Parameter, Measure)
+
+addWorksheet(wb, eff)
+writeData(wb, eff, df_eff)
+}
+
+# Save file
+
+saveWorkbook(wb, file.path(output_dir, "Summary.xlsx"), overwrite = TRUE)
+
+
+```
+
+# create wide df 
+
+```{r}
+
+# CREATE WIDE DATA FOR EXPORT (CONTROL, TREATED, TC COLUMNS)
+
+
+# Compute Control, Treated, and TC for each SID × Effect × Parameter
+wide_base <- df %>%
+  select(SID, Arm, Condition, Effect, Parameter, Value) %>%
+  pivot_wider(
+    names_from = Condition,
+    values_from = Value
+  ) %>%
+  mutate(
+    TC = ifelse(!is.na(Control) & !is.na(Treated),
+                Treated / Control,
+                NA_real_)
+  )
+
+# Pivot wider so that HR_Cmax_Control, HR_Cmax_Treated, HR_Cmax_TC, etc. become columns
+wide_data <- wide_base %>%
+  mutate(
+    col_Control = paste0(Effect, "_", Parameter, "_Control"),
+    col_Treated = paste0(Effect, "_", Parameter, "_Treated"),
+    col_TC      = paste0(Effect, "_", Parameter, "_TC")
+  ) %>%
+  select(
+    SID, Arm,
+    col_Control, Control,
+    col_Treated, Treated,
+    col_TC, TC
+  ) %>%
+  pivot_longer(
+    cols = c(Control, Treated, TC),
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    FinalCol = case_when(
+      Measure == "Control" ~ col_Control,
+      Measure == "Treated" ~ col_Treated,
+      Measure == "TC"      ~ col_TC
+    )
+  ) %>%
+  select(SID, Arm, FinalCol, Value) %>%
+  pivot_wider(
+    names_from = FinalCol,
+    values_from = Value
+  ) %>%
+  arrange(Arm, SID)
+
+#Split into Hydrocortisone 
+wide_hc <- wide_data %>% filter(Arm == "Hydrocortisone") %>% select(-Arm)
+
+
+# SAVE OUTPUT EXCEL FILE
+
+output_dir <- "PD_Effect_Data"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+file_out <- file.path(output_dir, "data_wide.xlsx")
+
+wb2 <- createWorkbook()
+
+addWorksheet(wb2, "Hydrocortisone")
+writeData(wb2, "Hydrocortisone", wide_hc)
+
+
+saveWorkbook(wb2, file_out, overwrite = TRUE)
+
+
+```
+
+
+#### paired t tests
+
+```{r}
+
+file_paired <- file.path(output_dir, "Paired_TTests.xlsx")
+
+wb_paired <- createWorkbook()
+
+addWorksheet(wb_paired, "Hydrocortisone")
+writeData(wb_paired, "Hydrocortisone", paired_HC)
+
+saveWorkbook(wb_paired, file_paired, overwrite = TRUE)
+
+
+```
+
+
+
+# PD Effects  
+
+### saving plots 
+
+```{r}
+
+save_plot <- function(plot_object, filename, width = 6, height = 4, dpi = 300) {
+  ggsave(
+    filename = file.path(fig_dir, filename),
+    plot = plot_object,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+}
+
+
+```
+
+
+### HR and BP
+
+```{r}
+
+make_time_plots <- function(df, time_col, value_col, arm_label, effect_label,
+                            y_label = "Value",
+                            file_prefix = "Plot") {
+
+  # ---- REMOVE NA ROWS FOR THE VALUE COLUMN ----
+  df_clean <- df %>%
+    filter(!is.na(.data[[value_col]]),
+           !is.na(.data[[time_col]]))   # also ensure Time isn't NA
+
+  # Create summary for mean and SD
+  df_summary <- df_clean %>%
+    group_by(.data[[time_col]]) %>%
+    summarise(
+      mean_val = mean(.data[[value_col]], na.rm = TRUE),
+      sd_val   = sd(.data[[value_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # -------------------------
+  # Plot 1: 0–12 hours
+  # -------------------------
+  plot_0_12 <- ggplot() +
+    geom_ribbon(
+      data = df_summary,
+      aes(x = .data[[time_col]],
+          ymin = mean_val - sd_val,
+          ymax = mean_val + sd_val),
+      fill = "gray70", alpha = 0.4
+    ) +
+    geom_line(
+      data = df_summary,
+      aes(x = .data[[time_col]], y = mean_val),
+      color = "black", linewidth = 1
+    ) +
+    geom_point(
+      data = df_clean,
+      aes(x = .data[[time_col]], y = .data[[value_col]]),
+      color = "black", size = 2
+    ) +
+    scale_x_continuous(
+      limits = c(0, 12),
+      breaks = seq(0, 12, 4)
+    ) +
+    labs(
+      x = "Time (h)",
+      y = y_label
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_blank()
+    )
+
+  # Save 0–12 h plot
+  ggsave(
+    filename = file.path(fig_dir,
+                         paste0(file_prefix, "_", arm_label, "_", effect_label, "_0_12h.png")),
+    plot = plot_0_12,
+    width = 6, height = 4, dpi = 300
+  )
+
+
+  # -------------------------
+  # Plot 2: 0–24 hours
+  # -------------------------
+  plot_0_24 <- ggplot() +
+    geom_ribbon(
+      data = df_summary,
+      aes(x = .data[[time_col]],
+          ymin = mean_val - sd_val,
+          ymax = mean_val + sd_val),
+      fill = "gray70", alpha = 0.4
+    ) +
+    geom_line(
+      data = df_summary,
+      aes(x = .data[[time_col]], y = mean_val),
+      color = "black", linewidth = 1
+    ) +
+    geom_point(
+      data = df_clean,
+      aes(x = .data[[time_col]], y = .data[[value_col]]),
+      color = "black", size = 2
+    ) +
+    scale_x_continuous(
+      limits = c(0, 24),
+      breaks = seq(0, 24, 4)
+    ) +
+    labs(
+      x = "Time (h)",
+      y = y_label
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_blank()
+    )
+
+  # Save 0–24 h plot
+  ggsave(
+    filename = file.path(fig_dir,
+                         paste0(file_prefix, "_", arm_label, "_", effect_label, "_0_24h.png")),
+    plot = plot_0_24,
+    width = 6, height = 4, dpi = 300
+  )
+
+
+  # ---- RETURN PLOTS FOR HTML DISPLAY ----
+  list(
+    plot_0_12 = plot_0_12,
+    plot_0_24 = plot_0_24
+  )
+}
+
+
+
+```
+
+#### HC 
+
+```{r}
+
+# --- HC: HEART RATE ---
+p <- make_time_plots(
+  df = HC,
+  time_col = "Time",
+  value_col = "HR",
+  arm_label = "HC",
+  effect_label = "HR",
+  y_label = "Heart Rate (bpm)",
+  file_prefix = "HR"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 120))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 120))
+
+ggsave(
+  filename = file.path(fig_dir, "HR_HC_HR_0_12h.png"),
+  plot = p$plot_0_12,
+  width = 6, height = 4, dpi = 300
+)
+
+ggsave(
+  filename = file.path(fig_dir, "HR_HC_HR_0_24h.png"),
+  plot = p$plot_0_24,
+  width = 6, height = 4, dpi = 300
+)
+
+
+# --- HC: SYSTOLIC BP ---
+p <- make_time_plots(
+  df = HC,
+  time_col = "Time",
+  value_col = "Systolic_BP",
+  arm_label = "HC",
+  effect_label = "Systolic",
+  y_label = "Systolic BP (mmHg)",
+  file_prefix = "SystolicBP"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 140))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 140))
+
+ggsave(file.path(fig_dir, "SystolicBP_HC_Systolic_0_12h.png"),
+       p$plot_0_12, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(fig_dir, "SystolicBP_HC_Systolic_0_24h.png"),
+       p$plot_0_24, width = 6, height = 4, dpi = 300)
+
+
+# --- HC: DIASTOLIC BP ---
+p <- make_time_plots(
+  df = HC,
+  time_col = "Time",
+  value_col = "Diastolic_BP",
+  arm_label = "HC",
+  effect_label = "Diastolic",
+  y_label = "Diastolic BP (mmHg)",
+  file_prefix = "DiastolicBP"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 100))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 100))
+
+ggsave(file.path(fig_dir, "DiastolicBP_HC_Diastolic_0_12h.png"),
+       p$plot_0_12, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(fig_dir, "DiastolicBP_HC_Diastolic_0_24h.png"),
+       p$plot_0_24, width = 6, height = 4, dpi = 300)
+
+
+# --- HC: PULSE PRESSURE ---
+p <- make_time_plots(
+  df = HC,
+  time_col = "Time",
+  value_col = "Pulse_pressure",
+  arm_label = "HC",
+  effect_label = "PP",
+  y_label = "Pulse Pressure (mmHg)",
+  file_prefix = "PP"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 80))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 80))
+
+ggsave(file.path(fig_dir, "PP_HC_PP_0_12h.png"),
+       p$plot_0_12, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(fig_dir, "PP_HC_PP_0_24h.png"),
+       p$plot_0_24, width = 6, height = 4, dpi = 300)
+
+
+
+
+```
+
+
+#### HT
+
+```{r}
+
+# --- HT: HEART RATE ---
+p <- make_time_plots(
+  df = HT,
+  time_col = "Time",
+  value_col = "HR",
+  arm_label = "HT",
+  effect_label = "HR",
+  y_label = "Heart Rate (bpm)",
+  file_prefix = "HR"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 120))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 120))
+
+ggsave(file.path(fig_dir, "HR_HT_HR_0_12h.png"),
+       p$plot_0_12, width = 6, height = 4, dpi = 300)
+
+
+ggsave(file.path(fig_dir, "HR_HT_HR_0_24h.png"),
+       p$plot_0_24, width = 6, height = 4, dpi = 300)
+
+
+# --- HT: SYSTOLIC BP ---
+p <- make_time_plots(
+  df = HT,
+  time_col = "Time",
+  value_col = "Systolic_BP",
+  arm_label = "HT",
+  effect_label = "Systolic",
+  y_label = "Systolic BP (mmHg)",
+  file_prefix = "SystolicBP"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 140))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 140))
+
+ggsave(file.path(fig_dir, "SystolicBP_HT_Systolic_0_12h.png"),
+       p$plot_0_12, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(fig_dir, "SystolicBP_HT_Systolic_0_24h.png"),
+       p$plot_0_24, width = 6, height = 4, dpi = 300)
+
+
+# --- HT: DIASTOLIC BP ---
+p <- make_time_plots(
+  df = HT,
+  time_col = "Time",
+  value_col = "Diastolic_BP",
+  arm_label = "HT",
+  effect_label = "Diastolic",
+  y_label = "Diastolic BP (mmHg)",
+  file_prefix = "DiastolicBP"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 100))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 100))
+
+ggsave(file.path(fig_dir, "DiastolicBP_HT_Diastolic_0_12h.png"),
+       p$plot_0_12, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(fig_dir, "DiastolicBP_HT_Diastolic_0_24h.png"),
+       p$plot_0_24, width = 6, height = 4, dpi = 300)
+
+
+# --- HT: PULSE PRESSURE ---
+p <- make_time_plots(
+  df = HT,
+  time_col = "Time",
+  value_col = "Pulse_pressure",
+  arm_label = "HT",
+  effect_label = "PP",
+  y_label = "Pulse Pressure (mmHg)",
+  file_prefix = "PP"
+)
+
+p$plot_0_12 <- p$plot_0_12 + coord_cartesian(ylim = c(0, 80))
+p$plot_0_24 <- p$plot_0_24 + coord_cartesian(ylim = c(0, 80))
+
+ggsave(file.path(fig_dir, "PP_HT_PP_0_12h.png"),
+       p$plot_0_12, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(fig_dir, "PP_HT_PP_0_24h.png"),
+       p$plot_0_24, width = 6, height = 4, dpi = 300)
+
+
+
+```
+
+
+
+# Rain cloud for VAS 
+
+### new directory 
+
+```{r}
+
+fig_dir_raincloud_xcont <- file.path(output_dir, "Figures_raincloud_x_cont")
+if (!dir.exists(fig_dir_raincloud_xcont)) {
+  dir.create(fig_dir_raincloud_xcont)
+}
+
+
+```
+
+### continous raincloud function
+
+```{r}
+
+make_vas_raincloud_continuous <- function(df, vas_var, time_points,
+                                          y_label,
+                                          x_label = "Time (h)",
+                                          cloud_width = 0.45,
+                                          cloud_offset = 0.25) {
+
+  df_plot <- df %>%
+    filter(Time %in% time_points,
+           !is.na(.data[[vas_var]]))
+
+  ggplot(df_plot, aes(x = Time, y = .data[[vas_var]])) +
+
+    # ---- CLOUD (half violin, pushed right) ----
+    stat_halfeye(
+      aes(group = factor(Time)),
+      side = "right",
+      width = cloud_width,
+      adjust = 2,
+      justification = -cloud_offset,
+      alpha = 0.45,
+      fill = "darkblue"
+    ) +
+
+    # ---- BOX (slimmer) ----
+    geom_boxplot(
+      aes(group = factor(Time)),
+      width = 0.12,
+      outlier.shape = NA,
+      fill = "gray",
+      colour = "darkblue",
+      linewidth = 0.45,
+      alpha = 0.45
+    ) +
+
+    # ---- POINTS ----
+    geom_jitter(
+      aes(group = factor(Time)),
+      width = 0.06,
+      height = 0,
+      size = 1.6,
+      shape = 21,
+      stroke = 0.35,
+      fill = "gray",
+      colour = "black",
+      alpha = 0.9
+    ) +
+
+    # ---- AXES ----
+    scale_x_continuous(
+      breaks = c(0, 4, 8, 12, 24),
+      minor_breaks = time_points,
+      name = x_label
+    ) +
+
+    scale_y_continuous(
+      limits = c(0.8, 6.2),
+      breaks = 1:6
+    ) +
+
+    labs(y = y_label) +
+    theme_cowplot(font_size = 13) +
+    theme(
+      axis.ticks.x.minor = element_line(color = "grey80", linewidth = 0.3)
+    )
+}
+
+
+```
+
+### study arm and time window 
+```{r}
+
+study_days <- list(
+  HC = HC,
+  HT = HT
+)
+
+time_0_12 <- sort(unique(HC$Time[HC$Time >= 0 & HC$Time <= 12]))
+time_0_24 <- sort(unique(HC$Time[HC$Time >= 0 & HC$Time <= 24]))
+
+
+time_sets <- list(
+  `0_12h` = time_0_12,
+  `0_24h` = time_0_24
+)
+
+```
+
+### continous rain cloud 
+
+```{r}
+
+for (day in names(study_days)) {
+
+  df_day <- study_days[[day]]
+
+  for (vas in vas_vars) {
+
+    label <- vas_labels[[vas]]
+
+    for (tset in names(time_sets)) {
+
+      time_points <- time_sets[[tset]]
+
+      p <- make_vas_raincloud_continuous(
+        df = df_day,
+        vas_var = vas,
+        time_points = time_points,
+        y_label = label
+      )
+
+      filename <- paste0(
+        "VAS_", vas, "_", day, "_", tset, "_xcont.png"
+      )
+
+      ggsave(
+        filename = file.path(fig_dir_raincloud_xcont, filename),
+        plot = p,
+        width = 6,
+        height = 4,
+        dpi = 300
+      )
+    }
+  }
+}
+
+```
+
